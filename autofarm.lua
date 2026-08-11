@@ -4,6 +4,9 @@ local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local VirtualInputManager = game:GetService("VirtualInputManager")
+local TweenService = game:GetService("TweenService")
 
 -- 파일(message 34.txt)에 있는 모든 몹 표시 이름
 local ALL_MOBS = {
@@ -330,6 +333,634 @@ function setNoclip(v)
 	end
 end
 _G.setNoclip = setNoclip
+
+-- ---------- 자동 낚시 (자동기능) ----------
+local AutoFish = {
+	enabled = true,
+	statusText = "켜짐 — 물가 낚시자리 대기",
+	fishSession = false,
+	lastFishPrompt = 0,
+	lastFishTap = 0,
+	fishPromptBusy = false,
+	fishPrevAng = nil,
+	fishPrevT = nil,
+	fishArcKey = nil,
+	fishTappedArc = false,
+}
+_G.__AutoFish = AutoFish
+
+local FishingDefs = { COOLDOWN = 2, WATER_MAX_DISTANCE = 26 }
+pcall(function()
+	local defs = ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Defs")
+	FishingDefs = require(defs:WaitForChild("FishingDefs"))
+end)
+
+local _fpp = nil
+pcall(function() _fpp = fireproximityprompt end)
+if type(_fpp) ~= "function" then _fpp = nil end
+
+local function fishGetChar()
+	local plr = Players.LocalPlayer
+	if not plr then return nil, nil end
+	local c = plr.Character
+	if not c then return nil, nil end
+	local hum = c:FindFirstChildOfClass("Humanoid")
+	local hrp = c:FindFirstChild("HumanoidRootPart")
+	if hum and hrp and hum.Health > 0 then
+		return hrp, hum
+	end
+	return nil, nil
+end
+
+local function fishResetMovement(hum)
+	pcall(function() hum.PlatformStand = false end)
+end
+
+local function getFishingPanel()
+	local plr = Players.LocalPlayer
+	if not plr then return nil end
+	local pg = plr:FindFirstChild("PlayerGui")
+	if not pg then return nil end
+	local hud = pg:FindFirstChild("HudGui")
+	if not hud then
+		hud = pg:FindFirstChild("HUD") or pg:FindFirstChildWhichIsA("ScreenGui")
+	end
+	if hud then
+		local panel = hud:FindFirstChild("FishingPanel", true)
+		if panel then return panel end
+	end
+	return pg:FindFirstChild("FishingPanel", true)
+end
+
+local function findMyFishingPrompt()
+	local plr = Players.LocalPlayer
+	if not plr then return nil, nil end
+	local spots = Workspace:FindFirstChild("FishingSpots")
+	if not spots then return nil, nil end
+	local mine = spots:FindFirstChild("FishingSpot_" .. plr.UserId)
+	if not mine then return nil, nil end
+	local prompt = mine:FindFirstChild("FishingPrompt") or mine:FindFirstChildOfClass("ProximityPrompt")
+	if not prompt then return nil, mine end
+	return prompt, mine
+end
+
+local function fishingPromptDistance(prompt, spot, hrp)
+	local part = prompt.Parent
+	if not (part and part:IsA("BasePart")) then
+		part = spot and (spot:IsA("BasePart") and spot or spot:FindFirstChildWhichIsA("BasePart", true))
+	end
+	if not part then return math.huge end
+	return (hrp.Position - part.Position).Magnitude
+end
+
+local function triggerFishingPrompt(prompt)
+	if _fpp then
+		pcall(_fpp, prompt)
+		return
+	end
+	pcall(function()
+		prompt:InputHoldBegin()
+		task.wait((prompt.HoldDuration or 0) + 0.05)
+		prompt:InputHoldEnd()
+	end)
+end
+
+local function fishAngDiffDeg(a, b)
+	local d = math.abs((a - b) % 360)
+	if d > 180 then d = 360 - d end
+	return d
+end
+
+local function fishPointerAngleDeg(pointer)
+	local ox = pointer.Position.X.Offset
+	local oy = pointer.Position.Y.Offset
+	if math.abs(ox) < 0.5 and math.abs(oy) < 0.5 then return nil end
+	return (math.deg(math.atan2(oy, ox)) + 90) % 360
+end
+
+local function getFishingArc(panel)
+	local segments = panel:FindFirstChild("Segments")
+	if not segments then return nil end
+	local segCount = math.max(8, math.floor(tonumber(panel:GetAttribute("SegmentCount")) or 48))
+	local step = 360 / segCount
+	local lit = {}
+	for i = 0, segCount - 1 do
+		local seg = segments:FindFirstChild("Seg" .. i)
+		if seg and seg:IsA("GuiObject") and seg.BackgroundTransparency <= 0.35 then
+			lit[#lit + 1] = i
+		end
+	end
+	if #lit == 0 then return nil end
+
+	local sx, sy = 0, 0
+	for _, i in ipairs(lit) do
+		local rad = math.rad(i * step)
+		sx = sx + math.cos(rad)
+		sy = sy + math.sin(rad)
+	end
+	local center = math.deg(math.atan2(sy, sx)) % 360
+	local half = 0
+	for _, i in ipairs(lit) do
+		half = math.max(half, fishAngDiffDeg(i * step, center))
+	end
+	half = math.max(5, half - step * 0.4)
+	local key = string.format("%.1f:%.1f:%d", center, half, #lit)
+	return center, half, key
+end
+
+local function fishTapE()
+	local now = os.clock()
+	if now - AutoFish.lastFishTap < 0.2 then return end
+	AutoFish.lastFishTap = now
+	pcall(function()
+		VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+		VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+	end)
+end
+
+local function fishSignedAngDelta(fromDeg, toDeg)
+	return (toDeg - fromDeg + 180) % 360 - 180
+end
+
+local function resetFishRoundState()
+	AutoFish.fishPrevAng = nil
+	AutoFish.fishPrevT = nil
+	AutoFish.fishArcKey = nil
+	AutoFish.fishTappedArc = false
+end
+
+function AutoFish.tryFishMinigame()
+	local panel = getFishingPanel()
+	if not panel or not panel.Visible then
+		if AutoFish.fishSession then
+			AutoFish.fishSession = false
+		end
+		resetFishRoundState()
+		return false
+	end
+
+	AutoFish.fishSession = true
+	local _, hum = fishGetChar()
+	if hum then fishResetMovement(hum) end
+
+	local pointer = panel:FindFirstChild("Pointer")
+	if not pointer or not pointer.Visible then
+		resetFishRoundState()
+		AutoFish.statusText = "낚시 — 입질 대기"
+		return true
+	end
+
+	local center, half, key = getFishingArc(panel)
+	if not center then
+		resetFishRoundState()
+		AutoFish.statusText = "낚시 — 라운드 대기"
+		return true
+	end
+
+	if key ~= AutoFish.fishArcKey then
+		AutoFish.fishArcKey = key
+		AutoFish.fishTappedArc = false
+		AutoFish.fishPrevAng = nil
+		AutoFish.fishPrevT = nil
+	end
+
+	local ang = fishPointerAngleDeg(pointer)
+	if not ang then
+		AutoFish.statusText = "낚시 미니게임"
+		return true
+	end
+
+	local now = os.clock()
+	local vel = 0
+	local prevAng = AutoFish.fishPrevAng
+	if prevAng and AutoFish.fishPrevT then
+		local dt = now - AutoFish.fishPrevT
+		if dt > 0.001 and dt < 0.12 then
+			vel = fishSignedAngDelta(prevAng, ang) / dt
+		end
+	end
+	AutoFish.fishPrevAng = ang
+	AutoFish.fishPrevT = now
+
+	if AutoFish.fishTappedArc then
+		AutoFish.statusText = "낚시 — 다음 라운드"
+		return true
+	end
+
+	local leadT = 0.02
+	local pred = (ang + vel * leadT) % 360
+	local distNow = fishAngDiffDeg(ang, center)
+	local distPred = fishAngDiffDeg(pred, center)
+
+	local crossedCenter = false
+	if prevAng and math.abs(vel) > 8 then
+		local before = fishSignedAngDelta(center, prevAng)
+		local after = fishSignedAngDelta(center, pred)
+		if before * after <= 0 and math.abs(before) <= half and math.abs(after) <= half then
+			crossedCenter = true
+		end
+	end
+
+	local inZone = distNow <= (half * 0.98) or distPred <= (half * 0.95)
+	local nearCenter = distNow <= math.max(1.2, half * 0.4) or distPred <= math.max(1.5, half * 0.45)
+
+	if crossedCenter or inZone or nearCenter then
+		fishTapE()
+		task.defer(fishTapE)
+		AutoFish.fishTappedArc = true
+		AutoFish.statusText = "낚시 — 히트"
+	else
+		AutoFish.statusText = "낚시 — 존 대기"
+	end
+	return true
+end
+
+function AutoFish.tryStartFish()
+	if not AutoFish.enabled or AutoFish.fishSession then
+		return false
+	end
+
+	local hrp, hum = fishGetChar()
+	if not hrp then return false end
+
+	if hum then fishResetMovement(hum) end
+
+	local prompt, spot = findMyFishingPrompt()
+	if not prompt then
+		AutoFish.statusText = "낚시 — 물가에 서세요 (자리 대기)"
+		return true
+	end
+
+	if not prompt.Enabled then
+		AutoFish.statusText = "낚시 — 세션 대기"
+		return true
+	end
+
+	local maxDist = tonumber(prompt.MaxActivationDistance) or 10
+	local dist = fishingPromptDistance(prompt, spot, hrp)
+	if dist > maxDist + 1.5 then
+		AutoFish.statusText = string.format("낚시 — 물가로 더 가까이 (%.0f칸)", dist)
+		return true
+	end
+
+	local cd = tonumber(FishingDefs.COOLDOWN) or 2
+	local now = os.clock()
+	if now - AutoFish.lastFishPrompt < cd then
+		AutoFish.statusText = "낚시 — 쿨다운"
+		return true
+	end
+
+	if AutoFish.fishPromptBusy then return true end
+
+	AutoFish.fishPromptBusy = true
+	AutoFish.lastFishPrompt = now
+	AutoFish.statusText = "낚시 시작"
+	task.spawn(function()
+		triggerFishingPrompt(prompt)
+		task.wait(0.4)
+		AutoFish.fishPromptBusy = false
+	end)
+	return true
+end
+
+function AutoFish.tick()
+	if not AutoFish.enabled then return false end
+	if AutoFish.tryFishMinigame() then return true end
+	return AutoFish.tryStartFish()
+end
+
+-- 낚시 서버 리모트 동기화 (e51db9a=세션 시작, e9a3c07=세션 종료)
+task.spawn(function()
+	local okBoot = pcall(function()
+		if not game:IsLoaded() then game.Loaded:Wait() end
+		if Workspace:GetAttribute("ServerBootDone") ~= true then
+			Workspace:GetAttributeChangedSignal("ServerBootDone"):Wait()
+		end
+		local shared = ReplicatedStorage:WaitForChild("Shared", 60)
+		local remotes = shared:WaitForChild("Remotes", 60)
+		local seed = nil
+		local t0 = os.clock()
+		while not seed and os.clock() - t0 < 30 do
+			seed = remotes:GetAttribute("__s")
+			if not seed then task.wait(0.1) end
+		end
+		if not seed then error("서버 부팅 대기 시간 초과") end
+		task.wait(0.2)
+
+		local function hashName(s, id)
+			local str = s .. "|" .. id .. "|"
+			local h1, h2 = 5381, 52711
+			for i = 1, #str do
+				local b = string.byte(str, i)
+				h1 = (h1 * 33 + b) % 4294967296
+				h2 = (h2 * 31 + b) % 4294967296
+			end
+			return string.format("R%08x%08x", h1, h2)
+		end
+
+		local RemoteCache = {}
+		local function getRemote(logicalId, className)
+			if RemoteCache[logicalId] then return RemoteCache[logicalId] end
+			local name = hashName(seed, logicalId)
+			local inst = remotes:WaitForChild(name, 15)
+			if not inst or not inst:IsA(className) then
+				error("Remote 없음: " .. logicalId)
+			end
+			RemoteCache[logicalId] = inst
+			return inst
+		end
+
+		getRemote("e51db9a", "RemoteEvent").OnClientEvent:Connect(function(p1)
+			if type(p1) == "table" and p1.ok == true then
+				AutoFish.fishSession = true
+				AutoFish.statusText = "낚시 — 입질 대기"
+			end
+		end)
+		getRemote("e9a3c07", "RemoteEvent").OnClientEvent:Connect(function()
+			AutoFish.fishSession = false
+			if AutoFish.enabled then
+				AutoFish.statusText = "낚시 — 재시작 대기"
+			end
+		end)
+	end)
+	if not okBoot then
+		warn("[autofarm] 낚시 서버 동기화 연결 실패")
+	else
+		print("[autofarm] 낚시 서버 동기화 연결됨")
+	end
+end)
+
+RunService.RenderStepped:Connect(function()
+	if not AutoFish.enabled then
+		if AutoFish.fishSession then
+			AutoFish.fishSession = false
+			resetFishRoundState()
+		end
+		return
+	end
+	pcall(AutoFish.tick)
+end)
+
+-- 토글 제어용
+function setAutoFish(v)
+	local on = v == true or v == 1 or v == "true"
+	AutoFish.enabled = on
+	if on then
+		AutoFish.statusText = "켜짐 — 물가 낚시자리 대기"
+		local _, hum = fishGetChar()
+		if hum then fishResetMovement(hum) end
+		local plr = Players.LocalPlayer
+		if plr and plr.Character then
+			local hm = plr.Character:FindFirstChildOfClass("Humanoid")
+			if hm then fishResetMovement(hm) end
+		end
+	else
+		AutoFish.fishSession = false
+		AutoFish.fishPromptBusy = false
+		resetFishRoundState()
+		AutoFish.statusText = "꺼짐"
+	end
+end
+_G.setAutoFish = setAutoFish
+
+-- ---------- 자동 벌목 (AutoChop) ----------
+-- message (36).txt 포팅: 나무 그루터기(Stump) 벌목
+local AutoChop = {
+	enabled = true,
+	statusText = "켜짐 - 벌목 준비됨",
+	chopThread = nil,
+	moveThread = nil,
+	charConn = nil,
+}
+_G.__AutoChop = AutoChop
+
+local chopRemote = Net.event("e89c992")
+
+local function stumpSetCharacterStats(char)
+	if not char then return end
+	if not AutoChop.enabled then return end
+	local humanoid = char:FindFirstChild("Humanoid")
+	if humanoid then
+		humanoid.WalkSpeed = 60
+		humanoid.JumpPower = 70
+	end
+end
+
+local function findAllStumps(folder)
+	local stumps = {}
+	if not folder then return stumps end
+	for _, child in ipairs(folder:GetChildren()) do
+		if child.Name == "Stump" then
+			table.insert(stumps, child)
+		elseif child:IsA("Folder") or child:IsA("Model") then
+			for _, sub in ipairs(findAllStumps(child)) do
+				table.insert(stumps, sub)
+			end
+		end
+	end
+	return stumps
+end
+
+local function findClosestStump(maxCount)
+	maxCount = maxCount or 20
+	local trees = Workspace:FindFirstChild("Decorations")
+	if trees then trees = trees:FindFirstChild("Trees") end
+	if not trees then return nil end
+
+	local allStumps = findAllStumps(trees)
+	if #allStumps == 0 then return nil end
+
+	local sample = {}
+	if #allStumps <= maxCount then
+		sample = allStumps
+	else
+		local shuffled = {}
+		for i, v in ipairs(allStumps) do shuffled[i] = v end
+		for i = #shuffled, 1, -1 do
+			local j = math.random(1, i)
+			shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
+		end
+		for i = 1, maxCount do
+			table.insert(sample, shuffled[i])
+		end
+	end
+
+	local char = Players.LocalPlayer.Character
+	if not char then return nil end
+	local root = char:FindFirstChild("HumanoidRootPart")
+	if not root then return nil end
+
+	local closest = nil
+	local closestDist = math.huge
+	local origin = root.Position
+	for _, stump in ipairs(sample) do
+		local dist = (stump.Position - origin).Magnitude
+		if dist < closestDist then
+			closestDist = dist
+			closest = stump
+		end
+	end
+	return closest
+end
+
+local function enableStumpCollision(stump)
+	if not stump then return end
+	for _, part in ipairs(stump:GetDescendants()) do
+		if part:IsA("BasePart") then
+			pcall(function()
+				part.CanCollide = true
+				part.CanTouch = true
+			end)
+		end
+	end
+	if stump:IsA("BasePart") then
+		pcall(function()
+			stump.CanCollide = true
+			stump.CanTouch = true
+		end)
+	end
+end
+
+local function stumpMoveLoop()
+	while AutoChop.enabled do
+		local char = Players.LocalPlayer.Character
+		if char and char.Parent then
+			local humanoid = char:FindFirstChild("Humanoid")
+			local root = char:FindFirstChild("HumanoidRootPart")
+			if humanoid and root and humanoid.Health > 0 then
+				local target = findClosestStump(20)
+				if target then
+					enableStumpCollision(target)
+
+					local targetPos = target.Position
+					root.Anchored = true
+
+					local speed = 60
+
+					local function tweenTo(pos)
+						local distance = (pos - root.Position).Magnitude
+						if distance < 0.5 then return end
+						local duration = math.max(distance / speed, 0.2)
+						local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear)
+						local tween = TweenService:Create(root, tweenInfo, {CFrame = CFrame.new(pos)})
+						tween:Play()
+						tween.Completed:Wait()
+					end
+
+					local downPos = Vector3.new(root.Position.X, root.Position.Y - 28, root.Position.Z)
+					tweenTo(downPos)
+
+					local flatPos = Vector3.new(targetPos.X, downPos.Y, targetPos.Z)
+					tweenTo(flatPos)
+
+					local onTopPos = Vector3.new(targetPos.X, targetPos.Y + 2, targetPos.Z)
+					tweenTo(onTopPos)
+
+					root.Anchored = false
+					root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+					root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+
+					while target and target.Parent and AutoChop.enabled do
+						local curChar = Players.LocalPlayer.Character
+						if not curChar or not curChar.Parent then break end
+						local curHumanoid = curChar:FindFirstChild("Humanoid")
+						if not curHumanoid or curHumanoid.Health <= 0 then break end
+
+						local curRoot = curChar:FindFirstChild("HumanoidRootPart")
+						if curRoot then
+							local dist = (onTopPos - curRoot.Position).Magnitude
+							if dist > 3 then
+								root.Anchored = true
+								tweenTo(onTopPos)
+								root.Anchored = false
+								root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+								root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+							end
+						end
+						task.wait(0.3)
+					end
+
+					task.wait(0.5)
+				end
+			end
+		end
+		task.wait(0.5)
+	end
+end
+
+local function spawnChopThread()
+	AutoChop.chopThread = task.spawn(function()
+		while AutoChop.enabled do
+			pcall(function()
+				if chopRemote then chopRemote:FireServer() end
+			end)
+			task.wait(0.1)
+		end
+	end)
+end
+
+local function onChopCharacterAdded(char)
+	if not AutoChop.enabled then return end
+	pcall(function()
+		char:WaitForChild("Humanoid", 5)
+		char:WaitForChild("HumanoidRootPart", 5)
+		stumpSetCharacterStats(char)
+	end)
+end
+
+local function startAutoChop()
+	if not AutoChop.moveThread then
+		AutoChop.moveThread = coroutine.create(stumpMoveLoop)
+		coroutine.resume(AutoChop.moveThread)
+	end
+	if not AutoChop.chopThread then
+		spawnChopThread()
+	end
+	if not AutoChop.charConn then
+		AutoChop.charConn = Players.LocalPlayer.CharacterAdded:Connect(onChopCharacterAdded)
+	end
+	local char = Players.LocalPlayer.Character
+	if char then
+		pcall(function()
+			char:WaitForChild("Humanoid", 5)
+			char:WaitForChild("HumanoidRootPart", 5)
+		end)
+		stumpSetCharacterStats(char)
+	end
+end
+
+local function setAutoChop(v)
+	AutoChop.enabled = v
+	if v then
+		AutoChop.statusText = "켜짐 - 벌목 준비됨"
+		startAutoChop()
+	else
+		AutoChop.statusText = "꺼짐"
+		if AutoChop.moveThread then
+			pcall(coroutine.close, AutoChop.moveThread)
+			AutoChop.moveThread = nil
+		end
+		if AutoChop.chopThread then
+			pcall(coroutine.close, AutoChop.chopThread)
+			AutoChop.chopThread = nil
+		end
+		local char = Players.LocalPlayer.Character
+		if char then
+			local root = char:FindFirstChild("HumanoidRootPart")
+			if root then
+				pcall(function()
+					root.Anchored = false
+					root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+					root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+				end)
+			end
+		end
+	end
+end
+_G.setAutoChop = setAutoChop
+
+-- 기본 켜짐 상태로 자동 시작
+startAutoChop()
 
 -- ---------- UI (Rayfield) ----------
 -- Rayfield 소스 내장 (Runtime HttpGet 불가 환경 대응)
@@ -4556,5 +5187,26 @@ if Rayfield then
 		state.target = nil -- 목표 재설정: 바꾼 몹이 다르면 다음 루프에서 재탐색
 		state.moveGoal = nil
 	end
+	})
+
+	-- ---------- 자동기능 ----------
+	local AutoTab = Window:CreateTab("자동기능", 0)
+	AutoTab:CreateToggle({
+		Name = "자동 낚시",
+		Default = true,
+		Callback = function(v)
+			setAutoFish(v)
+		end
+	})
+	AutoTab:CreateToggle({
+		Name = "자동 벌목",
+		Default = true,
+		Callback = function(v)
+			setAutoChop(v)
+		end
+	})
+	AutoTab:CreateParagraph({
+		Name = "자동 기능 상태",
+		Content = "자동 낚시: 물가에서 자동 낚시. 자동 벌목: 나무 그루터기에 자동으로 올라가 벌목합니다."
 	})
 end
