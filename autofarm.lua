@@ -36,6 +36,7 @@ local state = {
 	potionThreshold = 0.5,   -- 현재 체력이 최대 체력의 50% 미만이면 물약
 	lastPotion = 0,
 	lastSkill = 0,
+	noclip = false,          -- 노클립 토글
 }
 _G.__autofarm = state -- 전역 노출: UI/테스트/외부 컨트롤용
 
@@ -54,7 +55,9 @@ local function loadSwing(char, animator)
 end
 
 local function playSwing(char)
-	local animator = char:FindFirstChild("Humanoid") and char.Humanoid:FindFirstChild("Animator")
+	local hum = char:FindFirstChild("Humanoid")
+	if not hum then return end
+	local animator = hum:FindFirstChild("Animator")
 	if not animator then return end
 	local tracks = state.swingTracks[char]
 	if not tracks then tracks = loadSwing(char, animator) end
@@ -114,10 +117,11 @@ local function findTarget(charRoot)
 	local origin = charRoot.Position
 	local best, bestDist
 	for _, m in ipairs(Workspace:GetDescendants()) do
-		if m:IsA("Model") and m:FindFirstChild("Humanoid") and m:FindFirstChild("HumanoidRootPart") and m ~= charRoot and not m:IsDescendantOf(charRoot) then
-			if m:GetAttribute("Dead") ~= true and m.Humanoid.Health > 0 then
+		local hum = m:FindFirstChild("Humanoid")
+		local hrp = m:FindFirstChild("HumanoidRootPart")
+		if m:IsA("Model") and hum and hrp and m ~= charRoot and not m:IsDescendantOf(charRoot) then
+			if m:GetAttribute("Dead") ~= true and hum.Health > 0 then
 				if mobWanted(mobName(m)) then
-					local hrp = m.HumanoidRootPart
 					local d = (hrp.Position - origin).Magnitude
 					if d <= state.range and (bestDist == nil or d < bestDist) then
 						best, bestDist = m, d
@@ -207,53 +211,68 @@ local RE_TARGET = 8       -- 목표가 이만큼 떠나면 재경로
 
 function loop()
 	while state.running do
-		local player = Players.LocalPlayer
-		if player and player.Character then
-			local char = player.Character
-			local hrp = char:FindFirstChild("HumanoidRootPart")
-			local hum = char:FindFirstChild("Humanoid")
-			if hrp and hum then
-				if hum.Health <= 0 then
-					task.wait(5)
-				else
-					doAutoPotion(hum) -- 체력이 절반 이하이면 물약
-					if state.lastMobFilter ~= state.selectedMob then
-						state.lastMobFilter = state.selectedMob
-						state.target = nil
-						state.moveGoal = nil
-					end
-					local target = state.target
-					if not target or not target.Parent then target = findTarget(hrp) state.target = target end
-
-					if not target then
-						hum:MoveTo(hrp.Position) -- 정지
-						applySprint(hum)
-						state.moveGoal = nil
-						task.wait(0.5)
+		local ok, err = pcall(function()
+			local player = Players.LocalPlayer
+			if player and player.Character then
+				local char = player.Character
+				local hrp = char:FindFirstChild("HumanoidRootPart")
+				local hum = char:FindFirstChild("Humanoid")
+				if hrp and hum then
+					if hum.Health <= 0 then
+						task.wait(5)
 					else
-						local tPos = target.HumanoidRootPart.Position
-						local dist = (tPos - hrp.Position).Magnitude
+						doAutoPotion(hum) -- 체력이 절반 이하이면 물약
+						if state.lastMobFilter ~= state.selectedMob then
+							state.lastMobFilter = state.selectedMob
+							state.target = nil
+							state.moveGoal = nil
+						end
+						local target = state.target
+						if not target or not target.Parent then target = findTarget(hrp) state.target = target end
 
-						if dist <= MELEE then
-							hum:MoveTo(hrp.Position)
+						if not target or not target.Parent then
+							hum:MoveTo(hrp.Position) -- 정지
 							applySprint(hum)
 							state.moveGoal = nil
-							doAttack(char, hrp, target)
-							doAutoSkill(char)
-							task.wait(0.15)
+							state.target = nil
+							task.wait(0.3)
 						else
-							applySprint(hum)
-							-- 체크포인트: 현재 목표 지점과 새 목표가 크게 다를 때만 재경로
-							local cur = state.moveGoal
-							if not cur or (tPos - cur).Magnitude > RE_TARGET then
-								state.moveGoal = tPos
-								hum:MoveTo(tPos)
+							-- 대상의 위치를 안전하게 가져온다 (HumanoidRootPart 사라짐/변형 대비)
+							local tHrp = target:FindFirstChild("HumanoidRootPart")
+							if not tHrp then
+								state.target = nil -- 대상이 유효하지 않으면 재탐색
+								task.wait(0.1)
+								return
 							end
-							task.wait(0.15)
+							local tPos = tHrp.Position
+							local dist = (tPos - hrp.Position).Magnitude
+
+							if dist <= MELEE then
+								hum:MoveTo(hrp.Position)
+								applySprint(hum)
+								state.moveGoal = nil
+								doAttack(char, hrp, target)
+								doAutoSkill(char)
+								task.wait(0.15)
+							else
+								applySprint(hum)
+								-- 체크포인트: 현재 목표 지점과 새 목표가 크게 다를 때만 재경로
+								local cur = state.moveGoal
+								if not cur or (tPos - cur).Magnitude > RE_TARGET then
+									state.moveGoal = tPos
+									hum:MoveTo(tPos)
+								end
+								task.wait(0.15)
+							end
 						end
 					end
 				end
 			end
+		end)
+		if not ok then
+			-- 루프가 절대 죽지 않도록 오류는 기록하고 다음 프레임으로 넘어간다
+			warn("[autofarm] 루프 오류 (무시):", err)
+			task.wait(0.2)
 		end
 		task.wait(0.1)
 	end
@@ -279,6 +298,38 @@ function setSprint(v)
 		if hum then applySprint(hum) end
 	end
 end
+
+-- ---------- 노클립 (벽 통과) ----------
+-- 켜져 있으면 캐릭터의 HumanoidRootPart 주변 공간을 지우고
+-- 캐릭터 파츠들의 CanCollide를 계속 끄면서 벽에 갇히지 않게 한다.
+local noclipSpawned = false
+local function noclipLoop()
+	while state.noclip do
+		local player = Players.LocalPlayer
+		local char = player and player.Character
+		if char then
+			if not state.noclipBreakLock then
+				pcall(function()
+					for _, v in ipairs(char:GetDescendants()) do
+						if v:IsA("BasePart") and not v.Anchored then
+							v.CanCollide = false
+						end
+					end
+				end)
+			end
+		end
+		task.wait(0.1)
+	end
+	noclipSpawned = false
+end
+function setNoclip(v)
+	state.noclip = v and true or false
+	if v and not noclipSpawned then
+		noclipSpawned = true
+		task.spawn(noclipLoop)
+	end
+end
+_G.setNoclip = setNoclip
 
 -- ---------- UI (Rayfield) ----------
 -- Rayfield 소스 내장 (Runtime HttpGet 불가 환경 대응)
@@ -4486,6 +4537,11 @@ if Rayfield then
 		Name = "HP 50% 미만 자동 물약",
 		Default = true,
 		Callback = function(v) state.autoPotion = v end
+	})
+	Tab:CreateToggle({
+		Name = "노클립 (벽 통과)",
+		Default = false,
+		Callback = function(v) setNoclip(v) end
 	})
 	local opts = { "전체 (모든 몹)" }
 	for _, n in ipairs(ALL_MOBS) do opts[#opts + 1] = n end
